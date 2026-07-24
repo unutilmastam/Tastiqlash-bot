@@ -254,6 +254,24 @@ async def got_contact(m: Message):
             reply_markup=ReplyKeyboardRemove(),
         )
         return
+
+    # Ilovaga kiritilgan raqam token ichida yashiringan (oxirgi "_" dan keyin).
+    # Telegram'dan kelgan raqam bilan solishtiramiz — mos kelmasa, kod YUBORILMAYDI.
+    expected_phone = token.rsplit("_", 1)[1] if "_" in token else None
+    contact_phone_digits = "".join(ch for ch in m.contact.phone_number if ch.isdigit())
+
+    if expected_phone and contact_phone_digits != expected_phone:
+        await m.answer(
+            "❗️ Bu Telegram akkountingizning raqami ilovada kiritgan raqamingiz bilan "
+            "MOS KELMADI.\n\n"
+            "Kod xavfsizlik uchun faqat ilovada ko'rsatgan raqamingiz bilan bir xil "
+            "Telegram akkountiga yuboriladi. Iltimos:\n"
+            "• Ilovada to'g'ri raqamni kiriting, YOKI\n"
+            "• Shu raqam ro'yxatdan o'tgan Telegram akkountingizdan ulaning.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
     code = new_code()
     sessions[token] = {
         "code": code,
