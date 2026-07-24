@@ -2,10 +2,15 @@
 #  "Unutilmas Ta'm" — Telegram tasdiqlash boti + Kuryer tizimi + HTTP API
 #  Railway / Render uchun tayyor. aiogram 3.x + aiohttp + Firebase
 #
+#  YANGI: Kuryer bo'lish uchun botdan "so'rov" yuboriladi — faqat
+#  ADMIN (siz) uni tasdiqlaganingizdan keyin haqiqiy kuryerga aylanadi.
+#  Botdan o'zi ro'yxatdan o'tgan HAR KIM avtomatik kuryer bo'lib qolmaydi.
+#
 #  Muhit o'zgaruvchilari (Railway -> Variables):
-#    BOT_TOKEN               — @BotFather bergan token
-#    FIREBASE_SERVICE_ACCOUNT — Firebase xizmat hisobi JSON (butun matn)
-#    PORT                    — Railway o'zi beradi (default 8080)
+#    BOT_TOKEN                — @BotFather bergan token (mavjud)
+#    FIREBASE_SERVICE_ACCOUNT — Firebase xizmat hisobi JSON (yangi, to'liq matn)
+#    ADMIN_CHAT_ID            — Sizning shaxsiy Telegram chat ID'ingiz (yangi)
+#    PORT                     — Railway o'zi beradi (default 8080)
 # =============================================================
 import asyncio
 import json
@@ -27,19 +32,20 @@ from firebase_admin import credentials, firestore
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", 8080))
-CODE_TTL = 300      # kod 5 daqiqa amal qiladi
-MAX_TRIES = 5       # bitta kodga 5 marta urinish
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0") or 0)
+CODE_TTL = 300
+MAX_TRIES = 5
 
-# token -> {code, phone, chat, exp, tries}
-sessions: dict[str, dict] = {}
-# chat_id -> token (kontakt kutilayotgan foydalanuvchilar, OTP uchun)
-waiting: dict[int, str] = {}
-# chat_id -> True (ism kutilayotgan, kuryer ro'yxatdan o'tishi uchun)
-waiting_courier_name: dict[int, bool] = {}
+sessions = {}
+waiting = {}
+# chat_id -> True (ism kutilayotgan, kuryerlikka so'rov uchun)
+waiting_courier_name = {}
+# vaqtincha: applicant_id -> {name, chat_id, username} — admin tasdiqlagunча
+pending_applicants = {}
 
 dp = Dispatcher()
 
-# ---------- Firebase ----------
+# ---------------- Firebase ----------------
 _db = None
 def get_db():
     global _db
@@ -53,11 +59,11 @@ def get_db():
     _db = firestore.client()
     return _db
 
-def uid(prefix: str) -> str:
+def uid(prefix):
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
     return prefix + "_" + "".join(secrets.choice(alphabet) for _ in range(7))
 
-def get_couriers() -> list:
+def get_couriers():
     db = get_db()
     if not db: return []
     doc = db.collection("app").document("couriers").get()
@@ -68,7 +74,7 @@ def get_couriers() -> list:
     except Exception:
         return []
 
-def save_couriers(couriers: list):
+def save_couriers(couriers):
     db = get_db()
     if not db: return
     db.collection("app").document("couriers").set({
@@ -77,31 +83,35 @@ def save_couriers(couriers: list):
     })
 
 
-def new_code() -> str:
+def new_code():
     return f"{secrets.randbelow(900000) + 100000}"
 
 
-# ---------- BOT: OTP (o'zgarishsiz) ----------
+# =========================================================
+#  KURYERLIKKA SO'ROV — faqat ADMIN tasdiqlasa kuryer bo'ladi
+# =========================================================
 
 @dp.message(CommandStart(deep_link=True), F.text.startswith("/start kuryer"))
-async def start_courier_registration(m: Message):
+async def start_courier_request(m: Message):
     couriers = get_couriers()
-    existing = next((c for c in couriers if c.get("telegramChatId") == m.chat.id), None)
-    if existing:
-        await m.answer(
-            f"Assalomu alaykum, {existing['name']}! Siz allaqachon kuryer sifatida ro'yxatdan o'tgansiz. ✅\n"
-            "Yangi yetkazishlar shu yerga keladi."
-        )
+    already = next((c for c in couriers if c.get("telegramChatId") == m.chat.id), None)
+    if already:
+        status = already.get("status", "active")
+        if status == "active":
+            await m.answer(f"Assalomu alaykum, {already['name']}! Siz allaqachon tasdiqlangan kuryersiz. ✅")
+        else:
+            await m.answer("So'rovingiz hali admin tomonidan ko'rib chiqilmoqda. Iltimos, kuting.")
         return
     waiting_courier_name[m.chat.id] = True
     await m.answer(
-        "Assalomu alaykum! 🚴 «Unutilmas Ta'm» kuryerlar tizimiga xush kelibsiz!\n\n"
-        "Ro'yxatdan o'tish uchun to'liq ismingizni yozing (masalan: Bekzod Aliyev):"
+        "Assalomu alaykum! 🚴 «Unutilmas Ta'm»da kuryer bo'lish uchun so'rov yuborishingiz mumkin.\n\n"
+        "To'liq ismingizni yozing (masalan: Bekzod Aliyev) — so'rovingiz administratorga yuboriladi "
+        "va u tasdiqlagandan keyingina rasmiy kuryer bo'lasiz."
     )
 
 
 @dp.message(F.text, F.chat.id.in_(waiting_courier_name))
-async def courier_name_received(m: Message):
+async def courier_name_received(m: Message, bot: Bot):
     if not waiting_courier_name.get(m.chat.id):
         return
     name = m.text.strip()
@@ -109,21 +119,100 @@ async def courier_name_received(m: Message):
         await m.answer("Iltimos, ismingizni to'g'ri kiriting.")
         return
     waiting_courier_name.pop(m.chat.id, None)
+
+    applicant_id = uid("app")
+    pending_applicants[applicant_id] = {
+        "name": name,
+        "chat_id": m.chat.id,
+        "username": m.from_user.username or "",
+    }
+    await m.answer(
+        "Rahmat! So'rovingiz administratorga yuborildi. ⏳\n"
+        "Tasdiqlangach, sizga xabar keladi."
+    )
+
+    if ADMIN_CHAT_ID:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"crapprove:{applicant_id}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"crreject:{applicant_id}"),
+        ]])
+        uname_txt = f"@{m.from_user.username}" if m.from_user.username else "(username yo'q)"
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                f"🚴 <b>Yangi kuryerlik so'rovi</b>\n\nIsm: {name}\nTelegram: {uname_txt}\n\n"
+                "Tasdiqlaysizmi?",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            print("Adminga xabar yuborishda xato:", e)
+
+
+@dp.callback_query(F.data.startswith("crapprove:"))
+async def approve_courier(cb: CallbackQuery, bot: Bot):
+    if not ADMIN_CHAT_ID or cb.message.chat.id != ADMIN_CHAT_ID:
+        await cb.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    applicant_id = cb.data.split(":", 1)[1]
+    applicant = pending_applicants.pop(applicant_id, None)
+    if not applicant:
+        await cb.answer("So'rov topilmadi (eskirgan bo'lishi mumkin).", show_alert=True)
+        return
     couriers = get_couriers()
     courier = {
         "id": uid("cr"),
-        "name": name,
-        "telegramChatId": m.chat.id,
-        "telegramUsername": m.from_user.username or "",
+        "name": applicant["name"],
+        "telegramChatId": applicant["chat_id"],
+        "telegramUsername": applicant["username"],
+        "status": "active",
     }
     couriers.append(courier)
     save_couriers(couriers)
+    await cb.message.edit_text(f"✅ {applicant['name']} kuryer sifatida tasdiqlandi.")
+    try:
+        await bot.send_message(applicant["chat_id"], f"🎉 Tabriklaymiz, {applicant['name']}! Siz rasmiy kuryer sifatida tasdiqlandingiz.\n\nEndi sizga yetkazish topshiriqlari shu botga kelib turadi.")
+    except Exception:
+        pass
+    await cb.answer("Tasdiqlandi")
+
+
+@dp.callback_query(F.data.startswith("crreject:"))
+async def reject_courier(cb: CallbackQuery, bot: Bot):
+    if not ADMIN_CHAT_ID or cb.message.chat.id != ADMIN_CHAT_ID:
+        await cb.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    applicant_id = cb.data.split(":", 1)[1]
+    applicant = pending_applicants.pop(applicant_id, None)
+    if not applicant:
+        await cb.answer("So'rov topilmadi (eskirgan bo'lishi mumkin).", show_alert=True)
+        return
+    await cb.message.edit_text(f"❌ {applicant['name']}ning so'rovi rad etildi.")
+    try:
+        await bot.send_message(applicant["chat_id"], "So'rovingiz hozircha qabul qilinmadi.")
+    except Exception:
+        pass
+    await cb.answer("Rad etildi")
+
+
+@dp.message(F.text == "/kuryerlar")
+async def list_couriers(m: Message):
+    if not ADMIN_CHAT_ID or m.chat.id != ADMIN_CHAT_ID:
+        return
+    couriers = get_couriers()
+    active = [c for c in couriers if c.get("status", "active") == "active"]
+    lines = "\n".join(f"• {c['name']}" for c in active) or "Hali tasdiqlangan kuryer yo'q."
+    pending_lines = "\n".join(f"• {a['name']}" for a in pending_applicants.values()) or "Yo'q"
     await m.answer(
-        f"Rahmat, {name}! Siz kuryer sifatida ro'yxatdan o'tdingiz. ✅\n\n"
-        "Endi ilova admin panelidan sizga yetkazish topshiriqlari yuborilishi mumkin — "
-        "ular shu yerga, botga kelib turadi."
+        f"🚴 <b>Tasdiqlangan kuryerlar:</b>\n{lines}\n\n"
+        f"⏳ <b>Kutilayotgan so'rovlar:</b>\n{pending_lines}",
+        parse_mode="HTML",
     )
 
+
+# =========================================================
+#  OTP (o'zgarishsiz)
+# =========================================================
 
 @dp.message(CommandStart(deep_link=True), F.text.startswith("/start t"))
 async def start_with_token(m: Message, command: CommandObject):
@@ -148,9 +237,8 @@ async def start_with_token(m: Message, command: CommandObject):
 @dp.message(CommandStart())
 async def start_plain(m: Message):
     await m.answer(
-        "Bu bot «Unutilmas Ta'm» ilovasi uchun tasdiqlash kodlarini yuboradi va "
-        "kuryerlar bilan aloqa qiladi.\n"
-        "Ro'yxatdan o'tishni ilovaning o'zidan boshlang — u sizni shu yerga olib keladi."
+        "Bu bot «Unutilmas Ta'm» ilovasi uchun tasdiqlash kodlarini yuboradi.\n"
+        "Ro'yxatdan o'tishni ilovaning o'zidan boshlang."
     )
 
 
@@ -203,9 +291,11 @@ async def resend_code(cb: CallbackQuery):
     await cb.answer("Yangi kod yuborildi")
 
 
-# ---------- HTTP API ----------
+# =========================================================
+#  HTTP API
+# =========================================================
 
-def json_cors(data: dict, status: int = 200) -> web.Response:
+def json_cors(data, status=200):
     return web.json_response(
         data,
         status=status,
@@ -217,7 +307,7 @@ def json_cors(data: dict, status: int = 200) -> web.Response:
     )
 
 
-async def verify_handler(request: web.Request) -> web.Response:
+async def verify_handler(request):
     if request.method == "OPTIONS":
         return json_cors({})
     try:
@@ -245,7 +335,7 @@ async def verify_handler(request: web.Request) -> web.Response:
     return json_cors({"ok": True, "phone": phone})
 
 
-async def send_courier_handler(request: web.Request, bot: Bot) -> web.Response:
+async def send_courier_handler(request, bot):
     """Ilova shu yerga so'rov yuboradi: {chat_id, message} -> kuryerga botdan xabar boradi."""
     if request.method == "OPTIONS":
         return json_cors({})
@@ -264,7 +354,7 @@ async def send_courier_handler(request: web.Request, bot: Bot) -> web.Response:
         return json_cors({"ok": False, "error": str(e)})
 
 
-async def health(request: web.Request) -> web.Response:
+async def health(request):
     return json_cors({"ok": True, "service": "unutilmas-tasdiqlash-va-kuryer"})
 
 
