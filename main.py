@@ -13,6 +13,8 @@
 #    PORT                     — Railway o'zi beradi (default 8080)
 # =============================================================
 import asyncio
+import base64
+import io
 import json
 import os
 import secrets
@@ -24,11 +26,17 @@ from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile,
 )
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", 8080))
@@ -38,9 +46,11 @@ MAX_TRIES = 5
 
 sessions = {}
 waiting = {}
-# chat_id -> True (ism kutilayotgan, kuryerlikka so'rov uchun)
-waiting_courier_name = {}
-# vaqtincha: applicant_id -> {name, chat_id, username} — admin tasdiqlagunча
+# Kuryerlikka ro'yxatdan o'tish — bosqichma-bosqich (ism -> telefon -> rasm)
+waiting_courier_name = {}   # chat_id -> True
+waiting_courier_phone = {}  # chat_id -> {"name": ...}
+waiting_courier_photo = {}  # chat_id -> {"name": ..., "phone": ...}
+# vaqtincha: applicant_id -> {name, phone, photo(base64), chat_id, username} — admin tasdiqlagunча
 pending_applicants = {}
 
 dp = Dispatcher()
@@ -82,13 +92,34 @@ def save_couriers(couriers):
         "t": int(time.time() * 1000),
     })
 
+def compress_photo_to_base64(raw_bytes: bytes) -> str:
+    """Kuryer rasmini kichraytirib, ilova kutayotgan base64 formatga o'tkazadi."""
+    if not HAS_PIL:
+        # Pillow bo'lmasa xom holicha (kattaroq, lekin ishlaydi)
+        b64 = base64.b64encode(raw_bytes).decode()
+        return f"data:image/jpeg;base64,{b64}"
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    max_size = 300
+    w, h = img.size
+    if w > h:
+        if w > max_size:
+            h = int(h * max_size / w); w = max_size
+    else:
+        if h > max_size:
+            w = int(w * max_size / h); h = max_size
+    img = img.resize((w, h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=75)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/jpeg;base64,{b64}"
+
 
 def new_code():
     return f"{secrets.randbelow(900000) + 100000}"
 
 
 # =========================================================
-#  KURYERLIKKA SO'ROV — faqat ADMIN tasdiqlasa kuryer bo'ladi
+#  KURYERLIKKA SO'ROV — ism -> telefon -> rasm -> admin tasdig'i
 # =========================================================
 
 @dp.message(CommandStart(deep_link=True), F.text.startswith("/start kuryer"))
@@ -105,13 +136,12 @@ async def start_courier_request(m: Message):
     waiting_courier_name[m.chat.id] = True
     await m.answer(
         "Assalomu alaykum! 🚴 «Unutilmas Ta'm»da kuryer bo'lish uchun so'rov yuborishingiz mumkin.\n\n"
-        "To'liq ismingizni yozing (masalan: Bekzod Aliyev) — so'rovingiz administratorga yuboriladi "
-        "va u tasdiqlagandan keyingina rasmiy kuryer bo'lasiz."
+        "1-qadam: To'liq ismingizni yozing (masalan: Bekzod Aliyev):"
     )
 
 
 @dp.message(F.text, F.chat.id.in_(waiting_courier_name))
-async def courier_name_received(m: Message, bot: Bot):
+async def courier_name_received(m: Message):
     if not waiting_courier_name.get(m.chat.id):
         return
     name = m.text.strip()
@@ -119,15 +149,68 @@ async def courier_name_received(m: Message, bot: Bot):
         await m.answer("Iltimos, ismingizni to'g'ri kiriting.")
         return
     waiting_courier_name.pop(m.chat.id, None)
+    waiting_courier_phone[m.chat.id] = {"name": name}
+
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+    await m.answer(
+        "2-qadam: Hozirda ishlatayotgan telefon raqamingizni yuboring 👇",
+        reply_markup=kb,
+    )
+
+
+@dp.message(F.contact, F.chat.id.in_(waiting_courier_phone))
+async def courier_phone_received(m: Message):
+    pending = waiting_courier_phone.get(m.chat.id)
+    if not pending:
+        return
+    if not m.contact or m.contact.user_id != m.from_user.id:
+        await m.answer("Iltimos, tugma orqali O'ZINGIZNING raqamingizni yuboring.")
+        return
+    phone = m.contact.phone_number
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    waiting_courier_phone.pop(m.chat.id, None)
+    waiting_courier_photo[m.chat.id] = {"name": pending["name"], "phone": phone}
+
+    await m.answer(
+        "3-qadam (oxirgi): O'zingizning aniq ko'rinadigan rasmingizni (selfie) yuboring 📷\n"
+        "(Kamera yoki galereyadan tanlab yuborishingiz mumkin)",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(F.photo, F.chat.id.in_(waiting_courier_photo))
+async def courier_photo_received(m: Message, bot: Bot):
+    pending = waiting_courier_photo.get(m.chat.id)
+    if not pending:
+        return
+    waiting_courier_photo.pop(m.chat.id, None)
+
+    name = pending["name"]
+    phone = pending["phone"]
+    photo_b64 = None
+    try:
+        largest = m.photo[-1]
+        file = await bot.get_file(largest.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, destination=buf)
+        photo_b64 = compress_photo_to_base64(buf.getvalue())
+    except Exception as e:
+        print("Kuryer rasmini yuklab olishda xato:", e)
 
     applicant_id = uid("app")
     pending_applicants[applicant_id] = {
         "name": name,
+        "phone": phone,
+        "photo": photo_b64,
         "chat_id": m.chat.id,
         "username": m.from_user.username or "",
     }
     await m.answer(
-        "Rahmat! So'rovingiz administratorga yuborildi. ⏳\n"
+        "Rahmat! So'rovingiz (ism, telefon va rasmingiz bilan) administratorga yuborildi. ⏳\n"
         "Tasdiqlangach, sizga xabar keladi."
     )
 
@@ -137,14 +220,20 @@ async def courier_name_received(m: Message, bot: Bot):
             InlineKeyboardButton(text="❌ Rad etish", callback_data=f"crreject:{applicant_id}"),
         ]])
         uname_txt = f"@{m.from_user.username}" if m.from_user.username else "(username yo'q)"
+        caption = (
+            f"🚴 <b>Yangi kuryerlik so'rovi</b>\n\n"
+            f"Ism: {name}\nTelefon: {phone}\nTelegram: {uname_txt}\n\nTasdiqlaysizmi?"
+        )
         try:
-            await bot.send_message(
-                ADMIN_CHAT_ID,
-                f"🚴 <b>Yangi kuryerlik so'rovi</b>\n\nIsm: {name}\nTelegram: {uname_txt}\n\n"
-                "Tasdiqlaysizmi?",
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
+            if photo_b64:
+                raw = base64.b64decode(photo_b64.split(",", 1)[1])
+                await bot.send_photo(
+                    ADMIN_CHAT_ID,
+                    BufferedInputFile(raw, filename="kuryer.jpg"),
+                    caption=caption, parse_mode="HTML", reply_markup=kb,
+                )
+            else:
+                await bot.send_message(ADMIN_CHAT_ID, caption, parse_mode="HTML", reply_markup=kb)
         except Exception as e:
             print("Adminga xabar yuborishda xato:", e)
 
@@ -163,13 +252,21 @@ async def approve_courier(cb: CallbackQuery, bot: Bot):
     courier = {
         "id": uid("cr"),
         "name": applicant["name"],
+        "phone": applicant.get("phone"),
+        "photo": applicant.get("photo"),
         "telegramChatId": applicant["chat_id"],
         "telegramUsername": applicant["username"],
         "status": "active",
     }
     couriers.append(courier)
     save_couriers(couriers)
-    await cb.message.edit_text(f"✅ {applicant['name']} kuryer sifatida tasdiqlandi.")
+    try:
+        await cb.message.edit_caption(caption=f"✅ {applicant['name']} kuryer sifatida tasdiqlandi.")
+    except Exception:
+        try:
+            await cb.message.edit_text(f"✅ {applicant['name']} kuryer sifatida tasdiqlandi.")
+        except Exception:
+            pass
     try:
         await bot.send_message(applicant["chat_id"], f"🎉 Tabriklaymiz, {applicant['name']}! Siz rasmiy kuryer sifatida tasdiqlandingiz.\n\nEndi sizga yetkazish topshiriqlari shu botga kelib turadi.")
     except Exception:
@@ -187,7 +284,13 @@ async def reject_courier(cb: CallbackQuery, bot: Bot):
     if not applicant:
         await cb.answer("So'rov topilmadi (eskirgan bo'lishi mumkin).", show_alert=True)
         return
-    await cb.message.edit_text(f"❌ {applicant['name']}ning so'rovi rad etildi.")
+    try:
+        await cb.message.edit_caption(caption=f"❌ {applicant['name']}ning so'rovi rad etildi.")
+    except Exception:
+        try:
+            await cb.message.edit_text(f"❌ {applicant['name']}ning so'rovi rad etildi.")
+        except Exception:
+            pass
     try:
         await bot.send_message(applicant["chat_id"], "So'rovingiz hozircha qabul qilinmadi.")
     except Exception:
