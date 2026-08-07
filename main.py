@@ -475,6 +475,27 @@ async def send_courier_handler(request, bot):
         return json_cors({"ok": False, "error": str(e)})
 
 
+async def notify_admin_handler(request, bot):
+    """Ilova yangi buyurtma tushganda shu yerga so'rov yuboradi: {message}.
+    Xabar FAQAT ADMIN_CHAT_ID'ga (bot egasiga) boradi — boshqa hech kimga ko'rinmaydi."""
+    if request.method == "OPTIONS":
+        return json_cors({})
+    if not ADMIN_CHAT_ID:
+        return json_cors({"ok": False, "error": "admin_not_configured"})
+    try:
+        data = await request.json()
+    except Exception:
+        return json_cors({"ok": False, "error": "bad_request"})
+    message = str(data.get("message", "")).strip()
+    if not message:
+        return json_cors({"ok": False, "error": "missing_fields"})
+    try:
+        await bot.send_message(ADMIN_CHAT_ID, message, parse_mode="HTML")
+        return json_cors({"ok": True})
+    except Exception as e:
+        return json_cors({"ok": False, "error": str(e)})
+
+
 async def health(request):
     return json_cors({"ok": True, "service": "unutilmas-tasdiqlash-va-kuryer"})
 
@@ -495,6 +516,8 @@ async def main():
     app.router.add_route("OPTIONS", "/verify", verify_handler)
     app.router.add_route("POST", "/send-courier", lambda r: send_courier_handler(r, bot))
     app.router.add_route("OPTIONS", "/send-courier", lambda r: send_courier_handler(r, bot))
+    app.router.add_route("POST", "/notify-admin", lambda r: notify_admin_handler(r, bot))
+    app.router.add_route("OPTIONS", "/notify-admin", lambda r: notify_admin_handler(r, bot))
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
